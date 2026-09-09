@@ -1,0 +1,14 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+
+# no skill files
+.claude/
+
+# no temporary files
+*.csv
+*.xlsx
+
+# no database
+DB/

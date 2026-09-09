@@ -1,0 +1,47 @@
+# Read-only lipid library API.
+#
+#   docker compose up -d --build
+#   docker compose logs -f
+#   docker compose down
+#
+# Docs at http://localhost:7413/__docs__/
+#
+# The database is mounted, never copied into the image: it is 2.4 GB, it is
+# regenerable from the .lbm2 file, and keeping it out means the same image
+# serves any version of the library.
+
+services:
+  api:
+    build: .
+    image: shinylipids-api
+    container_name: lipid-api
+    restart: unless-stopped
+
+    # Published on all interfaces so other machines on the LAN can reach it
+    # (http://2026-9412.local:7413 or http://10.161.155.89:7413).
+    #
+    # This API has no authentication and no rate limiting: anyone who can route
+    # to this host can read the whole library and can issue expensive queries.
+    # That is a deliberate choice for a trusted local network -- revert to
+    # "127.0.0.1:7413:7413" to make it local-only again, or put a reverse proxy
+    # in front if this host is ever reachable from outside the LAN.
+    ports:
+      - "7413:7413"
+
+    volumes:
+      - ./DB/lipids.sqlite:/data/lipids.sqlite:ro
+      - ./name_formula_mismatches.csv:/data/name_formula_mismatches.csv:ro
+
+    # The process only ever reads; give it nothing it does not need.
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7413/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3

@@ -1,0 +1,21 @@
+# The build context must stay small. DB/ alone is 3.0 GB (the 794 MB .lbm2
+# plus the 2.4 GB SQLite), and none of it belongs in the image -- the database
+# is mounted read-only at runtime instead.
+DB/
+*.lbm2
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+
+# Generated exports: mounted alongside the database, not baked in.
+name_formula_mismatches*.csv
+
+# Nothing the API needs.
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj
+.claude/
+.git/
+.gitignore
