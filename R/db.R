@@ -31,6 +31,14 @@ lipid_count <- function(con) {
   sum(dbGetQuery(con, "SELECT n FROM lipid_class_summary")$n)
 }
 
+#' Total number of MS/MS peaks in the library.
+#'
+#' A column scan rather than a summary-table read, but n_peaks is a small
+#' integer column so it costs ~0.3 s once at startup.
+lipid_peak_count <- function(con) {
+  dbGetQuery(con, "SELECT sum(n_peaks) AS n FROM lipid")$n[1]
+}
+
 # Helper: "?,?,?" placeholder list for an IN clause.
 in_clause <- function(x) paste0("(", paste(rep("?", length(x)), collapse = ","), ")")
 

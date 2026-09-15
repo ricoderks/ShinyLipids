@@ -5,7 +5,11 @@ LANE_PX   <- 46   # vertical pitch between stacked label lanes, px
 LANE_PCT  <- 29   # the same pitch expressed in % of base peak
 LABEL_PCT <- 25   # length of a rotated "806.592" label, in % of base peak
 
-SPEC_SOURCE <- "spectrum"   # plotly event source id for the spectrum plot
+# plotly event source ids. The two tabs each own one so a zoom on the library
+# browser's spectrum does not re-lay the search tab's mirror plot, and vice
+# versa -- event_data() is keyed on this and nothing else.
+SPEC_SOURCE  <- "spectrum"
+QSPEC_SOURCE <- "query-spectrum"
 
 # Mirror-plot palette. Matched fragments keep their spectrum's colour so the
 # top/bottom identity survives; unmatched ones drop back to grey, which makes
@@ -160,4 +164,163 @@ peak_list_tsv <- function(s) {
     paste(sprintf("%.4f\t%.0f\t%.2f", p$mz, p$intensity, p$rel), collapse = "\n"),
     "\n"
   )
+}
+
+#' m/z window that comfortably contains one spectrum, or a mirrored pair.
+#'
+#' The window must cover both spectra so the mirror halves stay aligned. A
+#' pasted query spectrum has no precursor, so NA precursors drop out rather
+#' than poisoning the range.
+spectrum_xlim <- function(top, ref = NULL) {
+  mzs <- c(top$peaks$mz, top$meta$precursor_mz)
+  if (!is.null(ref)) mzs <- c(mzs, ref$peaks$mz, ref$meta$precursor_mz)
+  mzs <- mzs[is.finite(mzs)]
+  if (!length(mzs)) return(c(0, 1000))
+  rng <- range(mzs)
+  pad <- max(diff(rng) * 0.06, 5)
+  c(rng[1] - pad, rng[2] + pad)
+}
+
+#' A plotly placeholder for "nothing selected yet".
+spectrum_placeholder <- function(text) {
+  plot_ly(type = "scatter", mode = "markers") |>
+    layout(
+      xaxis = list(visible = FALSE), yaxis = list(visible = FALSE),
+      annotations = list(
+        text = text, showarrow = FALSE, xref = "paper", yref = "paper",
+        x = 0.5, y = 0.5, font = list(size = 14, color = "#7b8a8b")
+      )
+    ) |> config(displayModeBar = FALSE)
+}
+
+#' Draw one spectrum, or two mirrored against each other.
+#'
+#' Shared by the library browser and the spectrum search so the two views
+#' cannot drift apart; `source` keeps their zoom events separate.
+#'
+#' @param top,ref   Spectra in the shape get_spectrum() returns. `ref` NULL
+#'   draws a single, upward spectrum.
+#' @param match_a,match_b Indices of the matched peaks in `top` / `ref`.
+#'   NULL means "treat every peak of `top` as matched", which is what a lone
+#'   spectrum wants.
+#' @param ann_top,ann_ref Per-peak explanation strings, or NULL for none.
+#' @return A plotly object.
+spectrum_plot <- function(top, ref = NULL, match_a = NULL, match_b = integer(0),
+                          ann_top = NULL, ann_ref = NULL,
+                          label_peaks = TRUE, label_n = 8,
+                          show_precursor = TRUE, source = SPEC_SOURCE,
+                          xlim = NULL) {
+  if (is.null(xlim)) xlim <- spectrum_xlim(top, ref)
+  if (is.null(match_a)) match_a <- seq_len(nrow(top$peaks))
+  if (is.null(ann_top)) ann_top <- rep("", nrow(top$peaks))
+  if (!is.null(ref) && is.null(ann_ref)) ann_ref <- rep("", nrow(ref$peaks))
+
+  # Labels are laid out before the traces because the axis range, and so the
+  # precursor line's height, depends on how many lanes they need.
+  lay <- spectrum_layout(top, ref, xlim, label_n, enabled = isTRUE(label_peaks))
+  y_top <- lay$y_top
+  y_bot <- lay$y_bot
+
+  # One spectrum, drawn upward (dir = 1) or mirrored downward (dir = -1).
+  # Matched peaks keep the spectrum's colour, unmatched fall back to grey.
+  add_spectrum <- function(p, sp, dir, color, matched_idx, ann) {
+    pk <- sp$peaks
+    is_match <- seq_len(nrow(pk)) %in% matched_idx
+    for (grp in list(list(i = !is_match, col = UNMATCHED),
+                     list(i = is_match,  col = color))) {
+      if (!any(grp$i)) next
+      q <- pk[grp$i, , drop = FALSE]
+      qa <- ann[grp$i]
+      p <- p |>
+        add_segments(
+          x = q$mz, xend = q$mz, y = 0, yend = dir * q$rel,
+          line = list(color = grp$col, width = 1.5),
+          hoverinfo = "none", showlegend = FALSE
+        ) |>
+        add_markers(
+          x = q$mz, y = dir * q$rel,
+          marker = list(color = grp$col, size = 5, opacity = 0.01),
+          hoverinfo = "text", showlegend = FALSE,
+          text = paste0(
+            sprintf("%s<br>m/z %.4f<br>%.1f%% base peak<br>abs %.0f",
+                    sp$meta$name, q$mz, q$rel, q$intensity),
+            ifelse(nzchar(qa), paste0("<br><br>", qa), ""))
+        )
+    }
+    # A pasted query spectrum need not have a precursor at all.
+    if (isTRUE(show_precursor) && is.finite(sp$meta$precursor_mz)) {
+      p <- p |> add_segments(
+        x = sp$meta$precursor_mz, xend = sp$meta$precursor_mz, y = 0,
+        yend = dir * (if (dir > 0) y_top else y_bot) * 0.95,
+        line = list(color = "#e74c3c", width = 1, dash = "dot"),
+        hoverinfo = "text", showlegend = FALSE,
+        text = sprintf("precursor m/z %.4f", sp$meta$precursor_mz)
+      )
+    }
+    p
+  }
+
+  p <- plot_ly(source = source) |>
+    add_spectrum(top, 1, TOP_COLOR, match_a, ann_top)
+  if (!is.null(ref)) {
+    p <- p |> add_spectrum(ref, -1, REF_COLOR, match_b, ann_ref) |>
+      add_segments(x = xlim[1], xend = xlim[2], y = 0, yend = 0,
+                   line = list(color = "#95a5a6", width = 1),
+                   hoverinfo = "none", showlegend = FALSE)
+  }
+
+  # In mirror mode the axis runs negative, but intensity is a magnitude on
+  # both halves, so the tick labels stay positive.
+  ticks <- if (is.null(ref)) c(0, 25, 50, 75, 100) else c(-100, -50, 0, 50, 100)
+
+  p |> layout(
+    xaxis = list(title = "m/z", range = xlim, zeroline = FALSE),
+    # Headroom for the rotated peak labels above a 100% base peak.
+    # ticktext overrides ticksuffix, so the "%" has to be baked in here.
+    yaxis = list(title = "relative intensity (%)",
+                 range = c(-y_bot, y_top), zeroline = FALSE,
+                 tickvals = ticks, ticktext = paste0(abs(ticks), "%")),
+    annotations = lay$annotations, hovermode = "closest",
+    # Fragment explanations run to several lines; centred text makes them
+    # much harder to read than the two-line default tooltip was.
+    hoverlabel = list(align = "left"),
+    margin = list(t = 20, r = 10)
+  ) |> config(displaylogo = FALSE,
+              modeBarButtonsToRemove = list("select2d", "lasso2d"))
+}
+
+#' Re-lay the peak labels for the window a zoom/pan event left behind.
+#'
+#' Labels are laid out server-side at render, so a zoom would otherwise keep
+#' the spacing computed for the whole spectrum and never resolve a crowded
+#' region.
+#'
+#' @return A list for plotly's relayout, or NULL when the event is not a range
+#'   change -- our own annotation push and a resize both arrive here too, and
+#'   acting on them would loop.
+spectrum_relayout <- function(ed, top, ref = NULL, label_n = 8,
+                              label_peaks = TRUE) {
+  if (is.null(ed)) return(NULL)
+  full <- spectrum_xlim(top, ref)
+
+  # A drag zoom or pan sends the two bounds as separate keys; a programmatic
+  # relayout sends them as one array; double-click to reset sends autorange.
+  xlim <- if (!is.null(ed[["xaxis.range[0]"]]) && !is.null(ed[["xaxis.range[1]"]])) {
+    sort(c(as.numeric(ed[["xaxis.range[0]"]]), as.numeric(ed[["xaxis.range[1]"]])))
+  } else if (length(ed[["xaxis.range"]]) == 2L) {
+    sort(as.numeric(ed[["xaxis.range"]]))
+  } else if (isTRUE(ed[["xaxis.autorange"]])) {
+    full
+  } else {
+    return(NULL)
+  }
+
+  lay <- spectrum_layout(top, ref, xlim, label_n, enabled = isTRUE(label_peaks))
+  upd <- list(annotations = lay$annotations)
+  # Only reclaim vertical headroom if the user has not set their own y range
+  # (box zoom changes both axes); overriding it would fight them.
+  if (!any(grepl("^yaxis\\.range", names(ed)))) {
+    upd[["yaxis.range"]] <- c(-lay$y_bot, lay$y_top)
+  }
+  upd
 }
