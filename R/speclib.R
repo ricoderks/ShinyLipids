@@ -17,6 +17,16 @@ library(data.table)
 # picks a sensible default but a container may report a single core.
 setDTthreads(0)
 
+# findInterval() re-checks that its lookup vector is sorted, which means an
+# is.unsorted() scan of all 35M peaks -- ~34 ms per call, dwarfing the binary
+# search it guards. The peak array is sorted by construction, so skip it where
+# the argument exists (R >= 4.3) and fall back cleanly where it does not.
+.fi_checked <- "checkSorted" %in% names(formals(findInterval))
+mz_window <- function(x, vec) {
+  if (.fi_checked) findInterval(x, vec, checkSorted = FALSE)
+  else findInterval(x, vec)
+}
+
 # Stein & Scott (1994) weighting for the weighted dot product: w = mz^a * I^b.
 # Their optimum for library matching was a = 3, b = 0.6, which is what NIST
 # and MS-DIAL inherited; MassBank-style scoring uses a = 2, b = 0.5 instead,
@@ -69,6 +79,139 @@ parse_peak_text <- function(txt) {
   p$rel <- 100 * p$intensity / max(p$intensity)
   rownames(p) <- NULL
   list(peaks = p, n_skipped = n_skipped)
+}
+
+#' Normalise whatever an MSP file calls a polarity to the library's wording.
+#'
+#' Only unambiguous spellings are accepted: "N/A" must not become "Negative"
+#' just because it starts with an N, because that would quietly halve the
+#' searched library for a record that declared nothing at all.
+msp_ion_mode <- function(x) {
+  x <- toupper(trimws(ifelse(is.na(x), "", x)))
+  ifelse(grepl("^(P|POS|POSITIVE|\\+|1)$", x), "Positive",
+         ifelse(grepl("^(N|NEG|NEGATIVE|-|0)$", x), "Negative", ""))
+}
+
+# Field names as they are actually spelled in the wild, reduced to lowercase
+# alphanumerics so "Num Peaks", "PRECURSOR_MZ" and "Precursor_type" all land on
+# one key.
+MSP_FIELDS <- list(
+  name          = c("name", "title", "compoundname"),
+  precursor_mz  = c("precursormz", "precursormass", "precursor", "pepmass"),
+  adduct        = c("precursortype", "adduct", "adductionname", "adducttype"),
+  ion_mode      = c("ionmode", "ionizationmode", "polarity"),
+  retention_time = c("retentiontime", "rt", "rtinminutes")
+)
+
+#' Parse an MSP file holding any number of MS/MS spectra.
+#'
+#' MSP is a loose convention rather than a format, so this is deliberately
+#' forgiving: a record is `KEY: value` header lines followed by peak lines, and
+#' a line counts as a peak when its first field parses as a number. That single
+#' rule disposes of headers, `Num Peaks:` and the annotation string many files
+#' carry in a third peak column, without needing to know every field name.
+#'
+#' Records are split at each `NAME:` line -- every MSP dialect writes exactly
+#' one per record. Files with no NAME at all fall back to splitting on blank
+#' lines, which is the only other separator in use.
+#'
+#' @return list(meta, peaks, n_dropped):
+#'   `meta` is one row per record (name, precursor_mz, adduct, ion_mode,
+#'   retention_time, n_peaks), `peaks` the matching list of
+#'   data.frame(mz, intensity, rel), and `n_dropped` the number of records that
+#'   carried no usable peaks and were discarded.
+parse_msp <- function(txt) {
+  empty <- list(
+    meta = data.frame(name = character(0), precursor_mz = numeric(0),
+                      adduct = character(0), ion_mode = character(0),
+                      retention_time = numeric(0), n_peaks = integer(0),
+                      stringsAsFactors = FALSE),
+    peaks = list(), n_dropped = 0L)
+  if (is.null(txt) || !length(txt)) return(empty)
+
+  lines <- trimws(unlist(strsplit(paste(txt, collapse = "\n"), "\r\n|\r|\n")))
+  n <- length(lines)
+  if (!n) return(empty)
+
+  blank <- !nzchar(lines)
+  tok1  <- sub("^([^ \t,;]+).*$", "\\1", lines)
+  num1  <- suppressWarnings(as.numeric(tok1))
+  is_peak <- !blank & !is.na(num1)
+  is_fld  <- !blank & !is_peak & grepl("^[^:]+:", lines)
+
+  key <- rep(NA_character_, n)
+  val <- rep(NA_character_, n)
+  key[is_fld] <- gsub("[^a-z0-9]", "",
+                      tolower(sub("^([^:]+):.*$", "\\1", lines[is_fld])))
+  val[is_fld] <- trimws(sub("^[^:]+:[ \t]*", "", lines[is_fld]))
+
+  is_name <- is_fld & key %in% MSP_FIELDS$name
+  if (any(is_name)) {
+    rec <- cumsum(is_name)          # anything before the first NAME is preamble
+  } else {
+    # No NAME anywhere: a record is a run of non-blank lines.
+    rec <- cumsum(!blank & c(TRUE, blank[-n]))
+  }
+  n_rec <- max(rec)
+  if (n_rec == 0L) return(empty)
+
+  # --- header fields --------------------------------------------------------
+  # The column is `k`, not `key`: data.table() reads a `key` argument as the
+  # sort key and would never create the column at all.
+  F <- data.table(rec = rec[is_fld], k = key[is_fld], val = val[is_fld])
+  F <- F[rec > 0L]
+  field <- function(keys) {
+    out <- rep(NA_character_, n_rec)
+    if (nrow(F)) {
+      # Last wins: a duplicated key in one record is a later line correcting
+      # an earlier one, not a second record.
+      g <- F[k %in% keys, .(v = val[.N]), keyby = rec]
+      out[g$rec] <- g$v
+    }
+    out
+  }
+
+  meta <- data.frame(
+    name           = field(MSP_FIELDS$name),
+    precursor_mz   = suppressWarnings(as.numeric(field(MSP_FIELDS$precursor_mz))),
+    adduct         = trimws(field(MSP_FIELDS$adduct)),
+    ion_mode       = msp_ion_mode(field(MSP_FIELDS$ion_mode)),
+    retention_time = suppressWarnings(as.numeric(field(MSP_FIELDS$retention_time))),
+    stringsAsFactors = FALSE
+  )
+  meta$name[is.na(meta$name) | !nzchar(meta$name)] <-
+    sprintf("spectrum %d", which(is.na(meta$name) | !nzchar(meta$name)))
+  meta$adduct[is.na(meta$adduct)] <- ""
+
+  # --- peaks ----------------------------------------------------------------
+  pi <- which(is_peak & rec > 0L)
+  rest <- sub("^[^ \t,;]+[ \t,;]+", "", lines[pi])
+  int <- suppressWarnings(as.numeric(sub("^([^ \t,;]+).*$", "\\1", rest)))
+
+  P <- data.table(rec = rec[pi], mz = num1[pi], intensity = int)
+  P <- P[is.finite(mz) & is.finite(intensity) & mz > 0 & intensity > 0]
+  if (nrow(P)) {
+    P[, rel := 100 * intensity / max(intensity), by = rec]
+    setorder(P, rec, mz)
+  }
+
+  by_rec <- split(as.data.frame(P[, .(mz, intensity, rel)]), P$rec)
+  peaks <- vector("list", n_rec)
+  for (i in seq_len(n_rec)) {
+    d <- by_rec[[as.character(i)]]
+    if (is.null(d)) d <- data.frame(mz = numeric(0), intensity = numeric(0),
+                                    rel = numeric(0))
+    rownames(d) <- NULL
+    peaks[[i]] <- d
+  }
+  meta$n_peaks <- vapply(peaks, nrow, integer(1))
+
+  # A record with no peaks is a header block, not a spectrum; MSP files often
+  # end with one, and searching it would only produce an empty row.
+  keep <- meta$n_peaks > 0L
+  meta <- meta[keep, , drop = FALSE]
+  rownames(meta) <- NULL
+  list(meta = meta, peaks = peaks[keep], n_dropped = sum(!keep))
 }
 
 #' Wrap a parsed peak list so it can be handed to the spectrum plotting code.
@@ -158,6 +301,11 @@ build_peak_index <- function(con, progress = NULL) {
   ix$mz  <- mz[ord]
   ix$rel <- rel[ord]
   ix$rec <- rec[ord]
+  # Records in precursor order, so a precursor filter is two binary searches
+  # rather than a comparison against all 5.3M precursors. Batch searches run
+  # one filter per query spectrum, where that difference is the whole cost.
+  ix$prec_ord <- order(r$precursor_mz, method = "radix")
+  ix$prec_sorted <- r$precursor_mz[ix$prec_ord]
   ix$n_peaks_total <- length(ord)
   ix$wnorm <- new.env(parent = emptyenv())   # memoised weighted norms
   rm(mz, rel, rec, ord); invisible(gc(FALSE))
@@ -255,20 +403,24 @@ search_spectrum <- function(ix, q, tol_da = 0.01, tol_ppm = 0,
 
   # --- candidate peaks: two binary searches per query peak ------------------
   tol <- mz_tolerance(q_mz, tol_da, tol_ppm)
-  lo <- findInterval(q_mz - tol, ix$mz)
-  hi <- findInterval(q_mz + tol, ix$mz)
+  lo <- mz_window(q_mz - tol, ix$mz)
+  hi <- mz_window(q_mz + tol, ix$mz)
   cnt <- hi - lo
   if (sum(cnt) == 0) return(with_counts(none, n_filtered, 0))
 
   pidx <- sequence(cnt, from = lo + 1L)      # positions in the sorted arrays
   qidx <- rep.int(seq_along(q_mz), cnt)      # which query peak each came from
+  prec <- ix$rec[pidx]                       # record each candidate peak is in
 
-  H <- data.table(rec = ix$rec[pidx], qi = qidx, li = pidx,
-                  lrel = ix$rel[pidx])
+  # Drop disallowed records before the table is built, not after: under a
+  # precursor filter almost every peak in the m/z windows belongs to a record
+  # that is already out, and carrying them through is most of the work.
   if (!is.null(keep)) {
-    H <- H[keep[H$rec]]
-    if (nrow(H) == 0L) return(with_counts(none, n_filtered, 0))
+    sel <- keep[prec]
+    if (!any(sel)) return(with_counts(none, n_filtered, 0))
+    pidx <- pidx[sel]; qidx <- qidx[sel]; prec <- prec[sel]
   }
+  H <- data.table(rec = prec, qi = qidx, li = pidx, lrel = ix$rel[pidx])
 
   # --- greedy one-to-one pairing -------------------------------------------
   # Strongest intensity product first, then drop any later pair that reuses a
@@ -317,22 +469,38 @@ search_spectrum <- function(ix, q, tol_da = 0.01, tol_ppm = 0,
 
 #' Which library records the polarity / adduct / precursor filters allow.
 #'
+#' A precursor filter is answered from the precursor-sorted index, which leaves
+#' a few hundred candidate records; polarity and adduct are then checked on
+#' those alone. Without one, both are full-length vector comparisons -- still
+#' only a few tens of milliseconds, but worth avoiding per query spectrum in a
+#' batch run.
+#'
 #' @return A logical vector over records, or NULL when nothing is filtered --
 #'   the caller then skips the subset entirely rather than paying for a
 #'   5.3M-element all-TRUE mask.
 keep_mask <- function(ix, mode = NULL, adduct = NULL, precursor = NULL,
                       tol_da = 0.01, tol_ppm = 0) {
+  has_mode <- !is.null(mode) && length(mode) == 1L && nzchar(mode)
+  has_add  <- length(adduct) > 0
+  has_prec <- !is.null(precursor) && length(precursor) == 1L &&
+              is.finite(precursor)
+
+  if (has_prec) {
+    ptol <- mz_tolerance(precursor, tol_da, tol_ppm)
+    lo <- mz_window(precursor - ptol, ix$prec_sorted)
+    hi <- mz_window(precursor + ptol, ix$prec_sorted)
+    cand <- if (hi > lo) ix$prec_ord[seq.int(lo + 1L, hi)] else integer(0)
+    if (has_mode) cand <- cand[ix$ion_mode[cand] == mode]
+    if (has_add)  cand <- cand[ix$adduct[cand] %in% adduct]
+    keep <- logical(ix$n_rec)
+    keep[cand] <- TRUE
+    return(keep)
+  }
+
   keep <- NULL
   and <- function(x) if (is.null(keep)) x else keep & x
-
-  if (!is.null(mode) && length(mode) == 1L && nzchar(mode)) {
-    keep <- and(ix$ion_mode == mode)
-  }
-  if (length(adduct) > 0) keep <- and(ix$adduct %in% adduct)
-  if (!is.null(precursor) && length(precursor) == 1L && is.finite(precursor)) {
-    keep <- and(abs(ix$precursor_mz - precursor) <=
-                  mz_tolerance(precursor, tol_da, tol_ppm))
-  }
+  if (has_mode) keep <- and(ix$ion_mode == mode)
+  if (has_add)  keep <- and(ix$adduct %in% adduct)
   keep
 }
 

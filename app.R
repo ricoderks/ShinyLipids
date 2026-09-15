@@ -1,7 +1,8 @@
 ## ShinyLipids -- browse and visualise MS/MS spectra from an MS-DIAL lipid library.
 ##
 ## Two tabs: a library browser (search by name / m/z / class / adduct) and a
-## spectrum search that matches a pasted MS/MS peak list against every record.
+## spectrum search that matches MS/MS spectra -- one pasted peak list, or a
+## whole MSP file of them -- against every record.
 ##
 ## The library lives in DB/lipids.sqlite, built from the .lbm2 file by
 ## scripts/lbm2_to_sqlite.py. See R/db.R for the record query layer,
@@ -28,12 +29,24 @@ N_PEAKS   <- lipid_peak_count(con)
 
 MAX_ROWS <- 500
 
-# Most intense peaks kept from a pasted query spectrum. Real centroided MS/MS
-# rarely reaches this; a profile-mode paste would otherwise expand into tens of
+# Most intense peaks kept from a query spectrum. Real centroided MS/MS rarely
+# reaches this; a profile-mode record would otherwise expand into tens of
 # millions of candidate pairs and stall the session.
 MAX_QUERY_PEAKS <- 500
 
-APP_TITLE <- "ShinyLipids — MS/MS spectrum browser - v0.4.0"
+# Spectra taken from one uploaded MSP file. At ~10 ms each this is ~20 s of
+# searching, about as long as a single-threaded Shiny process should be held
+# by one request.
+MAX_QUERY_SPECTRA <- 2000
+
+# An MSP file for a full run reaches a few MB; Shiny's own default is 5 MB.
+options(shiny.maxRequestSize = 64 * 1024^2)
+
+# A sample upload, served from the app directory rather than www/: it is an
+# example input, not an asset the page itself loads.
+EXAMPLE_MSP <- "example.msp"
+
+APP_TITLE <- "ShinyLipids — MS/MS spectrum browser - v0.4.1"
 LIBRARY_FILE <- "Msp20251120132005_NCDK_conventional_converted_dev.lbm2"
 
 
@@ -251,20 +264,47 @@ ui <- page_navbar(
     layout_sidebar(
       sidebar = sidebar(
         width = 340,
-        title = "Query spectrum",
+        title = "Query spectra",
 
-        textAreaInput(
-          "q_text", NULL, rows = 9, resize = "vertical",
-          placeholder = paste(
-            "Paste m/z and intensity, one peak per line:",
-            "283.2643, 100", "303.2330, 55.3", "766.5392, 12",
-            "", "Comma, tab, semicolon or spaces all work;",
-            "header lines and MSP fields are ignored.",
-            sep = "\n")
+        # Re-rendered rather than updated: Shiny has no way to clear a
+        # fileInput's chosen file, so "Clear" replaces the control itself.
+        uiOutput("q_file_ui"),
+
+        # What the file has to look like, said where the file is chosen. The
+        # sample is only offered when it is actually on disk, so a deployment
+        # without it gets no dead link.
+        tags$div(
+          class = "small text-muted mb-3",
+          "Per record: ", tags$code("PRECURSORMZ"), ", ",
+          tags$code("IONMODE"), ", optionally ", tags$code("PRECURSORTYPE"),
+          ", then the peaks as tab-separated m/z and intensity.",
+          if (file.exists(EXAMPLE_MSP)) tagList(
+            " ", downloadLink("q_example", "Download an example"), "."
+          )
         ),
 
-        numericInput("q_prec", "Precursor m/z (optional)", value = NA,
+        checkboxInput(
+          "q_file_meta",
+          "Use each record's precursor, polarity and adduct", TRUE),
+        tags$div(
+          class = "small text-muted mb-3",
+          "Off, or where a record does not declare one, the settings below ",
+          "apply to every spectrum."
+        ),
+
+        tags$hr(class = "my-2"),
+        tags$label(class = "control-label mb-1", "…or paste one spectrum"),
+        textAreaInput(
+          "q_text", NULL, rows = 6, resize = "vertical",
+          placeholder = paste(
+            "283.2643, 100", "303.2330, 55.3", "766.5392, 12",
+            "", "Comma, tab, semicolon or spaces all work.",
+            sep = "\n")
+        ),
+        numericInput("q_prec", "Precursor m/z (pasted spectrum)", value = NA,
                      min = 0, step = 0.0001),
+
+        tags$hr(class = "my-2"),
 
         # Both tolerances apply at once and the wider wins, so "10 ppm but
         # never tighter than 0.005 Da" is a single setting rather than a mode
@@ -311,7 +351,7 @@ ui <- page_navbar(
       layout_column_wrap(
         width = 1/3, fill = FALSE, heights_equal = "row",
         value_box(
-          title = "Query peaks", value = textOutput("q_n_peaks", inline = TRUE),
+          title = "Query spectra", value = textOutput("q_n_queries", inline = TRUE),
           showcase = bsicons::bs_icon("list-ol"), theme = "primary",
           textOutput("q_peak_note", inline = TRUE)
         ),
@@ -330,13 +370,41 @@ ui <- page_navbar(
         )
       ),
 
+      # Only earns its space once there is more than one spectrum to pick from;
+      # a one-row table above a pasted spectrum's own results is just noise.
+      conditionalPanel(
+        condition = "output.q_is_batch === true",
+        card(
+          # The card sits in the panel's flex column, where the results row
+          # below grows and would otherwise squeeze this one down to two
+          # visible rows -- no use as the batch's navigation. Pinning it at
+          # its height keeps five or six.
+          full_screen = TRUE, height = 320,
+          class = "flex-grow-0 flex-shrink-0",
+          card_header(
+            "Uploaded spectra",
+            tooltip(
+              bsicons::bs_icon("info-circle", title = "About the query list"),
+              paste(
+                "One row per record in the MSP file; click a row to see its",
+                "hits and mirror plot. Best match and score are for the",
+                "spectrum's own top hit under the current ranking.",
+                "An adduct the library does not contain is shown but not used",
+                "as a filter, so a typo cannot silently return nothing.")
+            ),
+            class = "d-flex justify-content-between align-items-center"
+          ),
+          DTOutput("q_queries")
+        )
+      ),
+
       layout_columns(
         col_widths = breakpoints(sm = 12, lg = c(8, 4)),
 
         card(
           full_screen = TRUE, min_height = 340,
           card_header(
-            "Library matches",
+            textOutput("q_hits_title", inline = TRUE),
             tags$div(
               class = "d-flex align-items-center gap-3",
               downloadLink("q_download", bsicons::bs_icon(
@@ -344,8 +412,8 @@ ui <- page_navbar(
               popover(
                 bsicons::bs_icon("gear", title = "Scoring options"),
                 title = "Scoring",
-                numericInput("q_top_n", "Hits returned", value = 200,
-                             min = 10, max = 2000, step = 10),
+                numericInput("q_top_n", "Hits returned per spectrum",
+                             value = 200, min = 10, max = 2000, step = 10),
                 tags$hr(),
                 tags$p(class = "small text-muted mb-2",
                        "Weighted dot product uses w = m/z", tags$sup("a"),
@@ -399,6 +467,7 @@ ui <- page_navbar(
       )
     )
   ),
+
   nav_spacer(),
   nav_item(
     actionLink("about", "About", class = "nav-link",
@@ -439,8 +508,12 @@ server <- function(input, output, session) {
       tags$h6("Spectrum search"),
       tags$p(
         class = "small mb-3",
-        "The second tab matches a pasted MS/MS peak list against every record ",
-        "the polarity, adduct and precursor filters allow. Hits are scored by ",
+        "The second tab matches MS/MS spectra against every record the ",
+        "polarity, adduct and precursor filters allow \u2014 one pasted peak ",
+        "list, or a whole ", tags$code(".msp"), " file of them, in which case ",
+        "each record's own ", tags$code("PRECURSORMZ"), ", ",
+        tags$code("IONMODE"), " and ", tags$code("PRECURSORTYPE"), " drive its ",
+        "search. Hits are scored by ",
         "dot product, weighted dot product (w = m/z", tags$sup("a"), " \u00d7 I",
         tags$sup("b"), ", after Stein & Scott) and reverse dot product, all as ",
         "cosine similarities on 0\u20131. The first search of a session spends ",
@@ -755,30 +828,72 @@ server <- function(input, output, session) {
                                format(ADDUCTS$n, big.mark = ",", trim = TRUE)))
   )
 
+  # --- query spectra: an uploaded MSP file, or one pasted peak list ---------
+
+  q_result   <- reactiveVal(NULL)   # the last search, or NULL
+  q_upload   <- reactiveVal(NULL)   # the parsed MSP file, or NULL
+  file_epoch <- reactiveVal(0L)
+
+  # Shiny cannot clear a fileInput's selection, so the control is rebuilt.
+  output$q_file_ui <- renderUI({
+    file_epoch()
+    fileInput("q_file", "MSP file", accept = c(".msp", ".txt", "text/plain"),
+              buttonLabel = "Browse…", placeholder = "no file selected")
+  })
+
+  observeEvent(input$q_file, {
+    f <- input$q_file
+    if (is.null(f)) return()
+    parsed <- tryCatch(
+      parse_msp(readLines(f$datapath, warn = FALSE, encoding = "UTF-8")),
+      error = function(e) NULL)
+
+    if (is.null(parsed) || nrow(parsed$meta) == 0) {
+      showNotification(
+        paste0("No MS/MS spectra found in '", f$name,
+               "'. Expected MSP: header lines such as PRECURSORMZ and ",
+               "IONMODE, then tab-separated m/z and intensity."),
+        type = "error", duration = 10)
+      # Clear the control too, or it keeps reading "Upload complete" under a
+      # file the app just refused.
+      file_epoch(file_epoch() + 1L)
+      q_upload(NULL); q_result(NULL)
+      return()
+    }
+    if (nrow(parsed$meta) > MAX_QUERY_SPECTRA) {
+      showNotification(
+        sprintf("'%s' holds %s spectra; keeping the first %s.", f$name,
+                format(nrow(parsed$meta), big.mark = ","),
+                format(MAX_QUERY_SPECTRA, big.mark = ",")),
+        type = "warning", duration = 10)
+      keep <- seq_len(MAX_QUERY_SPECTRA)
+      parsed$meta <- parsed$meta[keep, , drop = FALSE]
+      parsed$peaks <- parsed$peaks[keep]
+    }
+    if (parsed$n_dropped > 0) {
+      showNotification(
+        sprintf("%d record%s in '%s' carried no peaks and %s skipped.",
+                parsed$n_dropped, if (parsed$n_dropped == 1) "" else "s",
+                f$name, if (parsed$n_dropped == 1) "was" else "were"),
+        type = "message")
+    }
+    parsed$file <- f$name
+    q_upload(parsed)
+    q_result(NULL)
+  })
+
   observeEvent(input$q_clear, {
     updateTextAreaInput(session, "q_text", value = "")
     updateNumericInput(session, "q_prec", value = NA)
     updateSelectizeInput(session, "q_adduct", selected = character(0))
     updateRadioButtons(session, "q_mode", selected = "")
+    file_epoch(file_epoch() + 1L)
+    q_upload(NULL)
     q_result(NULL)
   })
 
-  # Parsed as the user types so the peak count and the "n lines ignored" hint
-  # are live feedback on the paste, well before a search is run.
+  # Parsed as the user types so the peak count is live feedback on the paste.
   q_parsed <- reactive(parse_peak_text(input$q_text)) |> debounce(300)
-  q_peaks  <- reactive(q_parsed()$peaks)
-
-  output$q_n_peaks <- renderText(format(nrow(q_peaks()), big.mark = ","))
-  output$q_peak_note <- renderText({
-    p <- q_parsed()
-    if (nrow(p$peaks) == 0) {
-      if (p$n_skipped > 0) "no numeric peaks found" else "paste a peak list"
-    } else if (p$n_skipped > 0) {
-      sprintf("%d line%s ignored", p$n_skipped, if (p$n_skipped == 1) "" else "s")
-    } else {
-      sprintf("m/z %.4f – %.4f", min(p$peaks$mz), max(p$peaks$mz))
-    }
-  })
 
   # A numeric input the user has cleared reads back as NA; every one of these
   # would otherwise turn a search into a silent no-match.
@@ -796,25 +911,57 @@ server <- function(input, output, session) {
                   input$q_prec else NULL
   ))
 
-  # Explicit button rather than a reactive: the first search has to build the
-  # peak index, and nobody wants that to fire off a half-finished paste.
-  q_result <- reactiveVal(NULL)
+  # The two input routes collapse into one shape here, so everything
+  # downstream -- the query table, the scoring loop, the plot -- is written
+  # once against a list of spectra rather than twice.
+  q_input <- reactive({
+    up <- q_upload()
+    if (!is.null(up)) return(up)
+    pk <- q_parsed()$peaks
+    if (nrow(pk) == 0) return(NULL)
+    list(
+      meta = data.frame(
+        name = "Pasted spectrum",
+        precursor_mz = if (is.null(q_opts()$prec)) NA_real_ else q_opts()$prec,
+        adduct = "", ion_mode = "", retention_time = NA_real_,
+        n_peaks = nrow(pk), stringsAsFactors = FALSE),
+      peaks = list(pk), n_dropped = 0L, file = NULL)
+  })
+
+  output$q_is_batch <- reactive({
+    q <- q_input()
+    !is.null(q) && nrow(q$meta) > 1
+  })
+  outputOptions(output, "q_is_batch", suspendWhenHidden = FALSE)
+
+  # --- the search -----------------------------------------------------------
 
   observeEvent(input$q_run, {
-    pk <- q_peaks()
-    if (nrow(pk) == 0) {
-      showNotification("Paste an MS/MS peak list first.", type = "warning")
+    qi <- q_input()
+    if (is.null(qi)) {
+      showNotification("Upload an MSP file or paste a peak list first.",
+                       type = "warning")
       q_result(NULL)
       return()
     }
-    if (nrow(pk) > MAX_QUERY_PEAKS) {
-      pk <- pk[order(-pk$rel)[seq_len(MAX_QUERY_PEAKS)], , drop = FALSE]
-      pk <- pk[order(pk$mz), , drop = FALSE]
-      showNotification(
-        sprintf("Searching on the %d most intense peaks of the query.",
-                MAX_QUERY_PEAKS), type = "message")
-    }
     o <- q_opts()
+    use_meta <- isTRUE(input$q_file_meta) && !is.null(q_upload())
+    n <- nrow(qi$meta)
+
+    # Peaks are capped per spectrum, not across the file: a profile-mode record
+    # would otherwise expand into tens of millions of candidate pairs.
+    peaks <- lapply(qi$peaks, function(pk) {
+      if (nrow(pk) <= MAX_QUERY_PEAKS) return(pk)
+      pk <- pk[order(-pk$rel)[seq_len(MAX_QUERY_PEAKS)], , drop = FALSE]
+      pk[order(pk$mz), , drop = FALSE]
+    })
+    n_capped <- sum(vapply(qi$peaks, nrow, 1L) > MAX_QUERY_PEAKS)
+    if (n_capped > 0) {
+      showNotification(
+        sprintf("%d spectr%s searched on %d most intense peaks.", n_capped,
+                if (n_capped == 1) "um" else "a", MAX_QUERY_PEAKS),
+        type = "message")
+    }
 
     ix <- if (peak_index_ready()) peak_index(con) else {
       withProgress(
@@ -825,58 +972,211 @@ server <- function(input, output, session) {
     }
 
     t0 <- Sys.time()
-    hits <- search_spectrum(
-      ix, pk, tol_da = o$tol_da, tol_ppm = o$tol_ppm,
-      mode = input$q_mode, adduct = input$q_adduct, precursor = o$prec,
-      min_match = o$min_match, mz_power = o$mz_power,
-      int_power = o$int_power, rank_by = input$q_rank, top_n = o$top_n
+    hits <- withProgress(
+      message = if (n > 1) sprintf("Searching %s spectra", format(n, big.mark = ","))
+                else "Searching the library",
+      value = 0,
+      lapply(seq_len(n), function(i) {
+        m <- qi$meta[i, ]
+        # A record's own header wins where it has one; the sidebar covers the
+        # rest. An adduct the library has never heard of is dropped rather
+        # than applied, or one stray PRECURSORTYPE would return nothing at all
+        # with no hint as to why.
+        mode <- if (use_meta && nzchar(m$ion_mode)) m$ion_mode else input$q_mode
+        add  <- if (use_meta && nzchar(m$adduct) && m$adduct %in% ADDUCTS$adduct) {
+          m$adduct
+        } else input$q_adduct
+        prec <- if (use_meta) {
+          if (is.finite(m$precursor_mz)) m$precursor_mz else NULL
+        } else o$prec
+
+        h <- search_spectrum(
+          ix, peaks[[i]], tol_da = o$tol_da, tol_ppm = o$tol_ppm,
+          mode = mode, adduct = add, precursor = prec,
+          min_match = o$min_match, mz_power = o$mz_power,
+          int_power = o$int_power, rank_by = input$q_rank, top_n = o$top_n)
+
+        if (n > 1) setProgress(value = i / n, detail = m$name)
+        attr(h, "prec") <- prec
+        h
+      })
     )
     elapsed <- as.numeric(Sys.time() - t0, units = "secs")
 
     # Names and classes are not in the index -- it holds only what scoring
-    # needs -- so they are fetched for the handful of rows actually shown.
-    if (nrow(hits) > 0) {
-      meta <- DBI::dbGetQuery(
-        con, paste0("SELECT id, name, lipid_class, formula, retention_time
-                       FROM lipid WHERE id IN (",
-                    paste(hits$id, collapse = ","), ")"))
-      m <- match(hits$id, meta$id)
-      hits$name <- meta$name[m]
-      hits$lipid_class <- meta$lipid_class[m]
-      hits$formula <- meta$formula[m]
-      hits$retention_time <- meta$retention_time[m]
-    }
-    q_result(list(hits = hits, elapsed = elapsed, prec = o$prec,
-                  n_filtered = attr(hits, "n_filtered"),
-                  n_hit = attr(hits, "n_hit"), query = pk, opts = o))
+    # needs -- so they are fetched once for every id actually on show.
+    ids <- unique(unlist(lapply(hits, `[[`, "id")))
+    meta <- if (length(ids)) DBI::dbGetQuery(
+      con, paste0("SELECT id, name, lipid_class, formula, retention_time
+                     FROM lipid WHERE id IN (",
+                  paste(ids, collapse = ","), ")")) else NULL
+    hits <- lapply(hits, function(h) {
+      if (nrow(h) == 0) {
+        h$name <- character(0); h$lipid_class <- character(0)
+        h$formula <- character(0); h$retention_time <- numeric(0)
+        return(h)
+      }
+      k <- match(h$id, meta$id)
+      h$name <- meta$name[k]; h$lipid_class <- meta$lipid_class[k]
+      h$formula <- meta$formula[k]; h$retention_time <- meta$retention_time[k]
+      h
+    })
+
+    q_result(list(meta = qi$meta, peaks = peaks, hits = hits,
+                  elapsed = elapsed, opts = o, batch = n > 1,
+                  file = qi$file))
   })
 
-  output$q_n_cand <- renderText({
+  # --- which query spectrum is on show -------------------------------------
+
+  q_i <- reactive({
+    qi <- q_input()
+    if (is.null(qi)) return(NA_integer_)
+    n <- nrow(qi$meta)
+    if (n == 1L) return(1L)
+    i <- input$q_queries_rows_selected
+    if (is.null(i) || length(i) == 0 || i > n) 1L else as.integer(i)
+  })
+
+  # What is actually on screen: the spectra the last search ran on, or -- before
+  # any search -- whatever is loaded. Keeping the peak note, the plot and the
+  # scores on one source stops them describing different spectra after an edit.
+  q_shown <- reactive({
     r <- q_result()
-    if (is.null(r) || is.na(r$n_filtered)) "—"
-    else format(r$n_filtered, big.mark = ",", scientific = FALSE)
+    if (!is.null(r)) list(meta = r$meta, peaks = r$peaks) else q_input()
+  })
+
+  q_hit_table <- reactive({
+    r <- q_result(); i <- q_i()
+    if (is.null(r) || is.na(i) || i > length(r$hits)) return(NULL)
+    r$hits[[i]]
+  })
+
+  # --- value boxes ----------------------------------------------------------
+
+  output$q_n_queries <- renderText({
+    qi <- q_input()
+    if (is.null(qi)) "0" else format(nrow(qi$meta), big.mark = ",")
+  })
+  output$q_peak_note <- renderText({
+    qs <- q_shown(); i <- q_i()
+    if (is.null(qs) || is.na(i) || i > length(qs$peaks)) {
+      p <- q_parsed()
+      if (p$n_skipped > 0) "no numeric peaks found" else "upload or paste a spectrum"
+    } else {
+      pk <- qs$peaks[[i]]
+      sprintf("%d peaks, m/z %.4f – %.4f in the selected one",
+              nrow(pk), min(pk$mz), max(pk$mz))
+    }
+  })
+  output$q_n_cand <- renderText({
+    h <- q_hit_table()
+    if (is.null(h) || is.na(attr(h, "n_filtered"))) "—"
+    else format(attr(h, "n_filtered"), big.mark = ",", scientific = FALSE)
   })
   output$q_cand_note <- renderText({
-    r <- q_result()
-    if (is.null(r)) "not searched yet"
-    else sprintf("%s shared a peak — %.2f s",
-                 format(r$n_hit, big.mark = ",", scientific = FALSE), r$elapsed)
+    r <- q_result(); h <- q_hit_table()
+    if (is.null(h)) "not searched yet"
+    else sprintf("%s shared a peak — %.2f s for %s spectr%s",
+                 format(attr(h, "n_hit"), big.mark = ",", scientific = FALSE),
+                 r$elapsed, format(length(r$hits), big.mark = ","),
+                 if (length(r$hits) == 1) "um" else "a")
   })
   output$q_best <- renderText({
-    r <- q_result()
-    if (is.null(r) || nrow(r$hits) == 0) "—" else r$hits$name[1]
+    h <- q_hit_table()
+    if (is.null(h) || nrow(h) == 0) "—" else h$name[1]
   })
   output$q_best_sub <- renderText({
-    r <- q_result()
-    if (is.null(r)) "run a search"
-    else if (nrow(r$hits) == 0) "no record matched"
+    h <- q_hit_table()
+    if (is.null(h)) "run a search"
+    else if (nrow(h) == 0) "no record matched"
     else sprintf("dot %.3f · weighted %.3f · reverse %.3f",
-                 r$hits$dot[1], r$hits$wdot[1], r$hits$rdot[1])
+                 h$dot[1], h$wdot[1], h$rdot[1])
+  })
+
+  # --- the uploaded-spectra table ------------------------------------------
+
+  output$q_queries <- renderDT({
+    qi <- q_input()
+    if (is.null(qi)) return(NULL)
+    r <- q_result()
+    # Only pair the hits with the query list they were produced from: a new
+    # upload must not inherit the previous file's best matches.
+    have <- !is.null(r) && length(r$hits) == nrow(qi$meta) &&
+            identical(r$meta, qi$meta)
+
+    # `i` is the query row; `empty` both types the result and fills the rows
+    # that have no hits yet.
+    top_hit <- function(f, empty) vapply(seq_len(nrow(qi$meta)), function(i) {
+      if (!have) return(empty)
+      h <- r$hits[[i]]
+      if (nrow(h) == 0) empty else f(h, i)
+    }, empty)
+
+    d <- data.frame(
+      `#`       = seq_len(nrow(qi$meta)),
+      Name      = qi$meta$name,
+      `m/z`     = qi$meta$precursor_mz,
+      Polarity  = ifelse(nzchar(qi$meta$ion_mode), qi$meta$ion_mode, "—"),
+      Adduct    = ifelse(nzchar(qi$meta$adduct), qi$meta$adduct, "—"),
+      Peaks     = qi$meta$n_peaks,
+      `Best match` = top_hit(function(h, i) h$name[1], NA_character_),
+      Score     = top_hit(function(h, i) h[[input$q_rank]][1], NA_real_),
+      # Counted against each spectrum's own peak total, which is the capped
+      # one the search actually used.
+      Match     = top_hit(function(h, i) sprintf("%d / %d", h$n_match[1],
+                                                 nrow(r$peaks[[i]])),
+                          NA_character_),
+      check.names = FALSE
+    )
+
+    datatable(
+      d, selection = list(mode = "single", selected = 1),
+      rownames = FALSE, fillContainer = TRUE,
+      options = list(
+        paging = FALSE, scrollY = "100%", scrollCollapse = TRUE,
+        scrollX = FALSE, dom = "ti", autoWidth = FALSE,
+        columnDefs = list(
+          list(className = "dt-right",
+               targets = which(names(d) %in%
+                 c("#", "m/z", "Peaks", "Score", "Match")) - 1L),
+          list(width = "4%",  targets = 0),
+          list(width = "22%", targets = 1),
+          list(width = "10%", targets = 2),
+          list(width = "9%",  targets = 3),
+          list(width = "11%", targets = 4),
+          list(width = "7%",  targets = 5),
+          list(width = "22%", targets = 6),
+          list(width = "8%",  targets = 7),
+          list(width = "7%",  targets = 8))
+      ),
+      callback = JS(
+        "table.on('draw.dt', function() {",
+        "  table.cells().every(function() {",
+        "    var n = this.node(); n.title = n.textContent;",
+        "  });",
+        "});"
+      )
+    ) |>
+      formatRound("m/z", 4, mark = "") |>
+      formatRound("Score", 3)
+  }, server = TRUE)
+
+  # --- the hit table --------------------------------------------------------
+
+  output$q_hits_title <- renderText({
+    r <- q_result()
+    if (is.null(r) || !isTRUE(r$batch)) "Library matches"
+    else paste("Library matches —", r$meta$name[q_i()])
   })
 
   output$q_hits <- renderDT({
-    r <- q_result()
-    d <- if (is.null(r)) NULL else r$hits
+    d <- q_hit_table()
+    prec <- if (is.null(d)) NULL else attr(d, "prec")
+    n_query <- {
+      r <- q_result()
+      if (is.null(r)) 0L else nrow(r$peaks[[q_i()]])
+    }
     if (is.null(d) || nrow(d) == 0) {
       d <- data.frame(Name = character(0), `m/z` = numeric(0),
                       Adduct = character(0), Match = character(0),
@@ -887,16 +1187,16 @@ server <- function(input, output, session) {
         Name    = d$name,
         `m/z`   = d$precursor_mz,
         Adduct  = d$adduct,
-        Match   = sprintf("%d / %d", d$n_match, nrow(r$query)),
+        Match   = sprintf("%d / %d", d$n_match, n_query),
         Dot     = d$dot,
         `W.dot` = d$wdot,
         `R.dot` = d$rdot,
         check.names = FALSE
       )
       # The precursor error only means anything when a precursor was given.
-      if (!is.null(r$prec)) {
+      if (!is.null(prec)) {
         tbl <- cbind(tbl[1:2],
-                     `Δppm` = 1e6 * (d$precursor_mz - r$prec) / r$prec,
+                     `Δppm` = 1e6 * (d$precursor_mz - prec) / prec,
                      tbl[3:7])
       }
       d <- tbl
@@ -934,34 +1234,36 @@ server <- function(input, output, session) {
     )
     # formatRound() errors on an empty column set, which is exactly what the
     # "no precursor given" and "no hits" cases hand it.
-    round_cols <- function(t, cols, digits) {
+    round_cols <- function(t, cols, digits, mark = ",") {
       cols <- intersect(cols, names(d))
-      if (length(cols)) formatRound(t, cols, digits) else t
+      if (length(cols)) formatRound(t, cols, digits, mark = mark) else t
     }
-    tab <- round_cols(tab, "m/z", 4)
+    tab <- round_cols(tab, "m/z", 4, mark = "")
     tab <- round_cols(tab, "Δppm", 1)
     round_cols(tab, c("Dot", "W.dot", "R.dot"), 3)
   }, server = TRUE)
 
+  # --- the mirror plot ------------------------------------------------------
+
   q_selected <- reactive({
-    r <- q_result()
+    d <- q_hit_table()
     i <- input$q_hits_rows_selected
-    if (is.null(r) || nrow(r$hits) == 0 || is.null(i) || length(i) == 0) return(NULL)
-    get_spectrum(con, r$hits$id[i])
+    if (is.null(d) || nrow(d) == 0 || is.null(i) || length(i) == 0) return(NULL)
+    get_spectrum(con, d$id[i])
   })
 
-  # The query as the plot helpers expect a spectrum, and the pair rescored the
-  # same way the table was so the two cannot disagree.
-  # Falls back to whatever is in the box so a pasted spectrum is plotted on
-  # its own straight away -- the quickest way to see that the paste parsed the
-  # way the user meant it to, before committing to a search.
+  # Falls back to whatever is loaded but not yet searched, so an upload or a
+  # paste is plotted straight away -- the quickest way to see that it parsed
+  # the way the user meant it to.
   q_top <- reactive({
-    r <- q_result()
-    pk   <- if (is.null(r)) q_peaks() else r$query
-    prec <- if (is.null(r)) q_opts()$prec else r$prec
+    src <- q_shown(); i <- q_i()
+    if (is.null(src) || is.na(i) || i > length(src$peaks)) return(NULL)
+    pk <- src$peaks[[i]]
     if (nrow(pk) == 0) return(NULL)
-    as_query_spectrum(pk, if (is.null(prec)) NA_real_ else prec)
+    m <- src$meta[i, ]
+    as_query_spectrum(pk, m$precursor_mz, m$name)
   })
+
   q_pair <- reactive({
     top <- q_top(); lib <- q_selected()
     if (is.null(top) || is.null(lib)) return(NULL)
@@ -977,13 +1279,13 @@ server <- function(input, output, session) {
 
   output$q_spectrum <- renderPlotly({
     top <- q_top()
-    if (is.null(top) || nrow(top$peaks) == 0) {
-      return(spectrum_placeholder("Paste an MS/MS peak list to plot it"))
+    if (is.null(top)) {
+      return(spectrum_placeholder(
+        "Upload an MSP file or paste an MS/MS peak list"))
     }
-    lib <- q_selected()
     m <- q_pair()
     spectrum_plot(
-      top = top, ref = lib,
+      top = top, ref = q_selected(),
       match_a = if (is.null(m)) NULL else m$match$a,
       match_b = if (is.null(m)) integer(0) else m$match$b,
       label_peaks = isTRUE(input$q_label_peaks), label_n = input$q_label_n,
@@ -993,7 +1295,7 @@ server <- function(input, output, session) {
 
   observeEvent(event_data("plotly_relayout", source = QSPEC_SOURCE), {
     top <- q_top()
-    if (is.null(top) || nrow(top$peaks) == 0) return()
+    if (is.null(top)) return()
     upd <- spectrum_relayout(
       event_data("plotly_relayout", source = QSPEC_SOURCE),
       top, q_selected(), input$q_label_n, isTRUE(input$q_label_peaks))
@@ -1002,8 +1304,8 @@ server <- function(input, output, session) {
   })
 
   output$q_meta <- renderUI({
-    s <- q_selected(); m <- q_pair()
-    if (is.null(s) || is.null(m)) return(NULL)
+    s <- q_selected(); m <- q_pair(); top <- q_top()
+    if (is.null(s) || is.null(m) || is.null(top)) return(NULL)
     o <- q_result()$opts
     field <- function(label, value) {
       if (is.null(value) || is.na(value) || !nzchar(as.character(value))) return(NULL)
@@ -1027,7 +1329,7 @@ server <- function(input, output, session) {
         tags$span(class = "me-4",
                   tags$small(class = "text-muted", "matched"), " ",
                   sprintf("%d of %d / %d peaks", length(m$match$a),
-                          nrow(q_top()$peaks), nrow(s$peaks))),
+                          nrow(top$peaks), nrow(s$peaks))),
         tags$span(class = "me-4",
                   tags$small(class = "text-muted", "dot"), " ",
                   sprintf("%.3f", m$dot)),
@@ -1043,31 +1345,60 @@ server <- function(input, output, session) {
     )
   })
 
+  output$q_example <- downloadHandler(
+    filename = function() basename(EXAMPLE_MSP),
+    contentType = "text/plain",
+    content = function(file) file.copy(EXAMPLE_MSP, file, overwrite = TRUE)
+  )
+
+  # --- CSV export -----------------------------------------------------------
+
   output$q_download <- downloadHandler(
     filename = function() sprintf("spectrum-search-%s.csv",
                                   format(Sys.time(), "%Y%m%d-%H%M%S")),
     content = function(file) {
       r <- q_result()
-      d <- if (is.null(r)) NULL else r$hits
-      if (is.null(d) || nrow(d) == 0) {
+      if (is.null(r)) {
         write.csv(data.frame(), file, row.names = FALSE)
         return()
       }
-      out <- data.frame(
-        name = d$name, lipid_class = d$lipid_class, formula = d$formula,
-        precursor_mz = round(d$precursor_mz, 4), adduct = d$adduct,
-        ion_mode = d$ion_mode, retention_time = round(d$retention_time, 3),
-        n_matched = d$n_match, n_query_peaks = nrow(r$query),
-        dot = round(d$dot, 5), weighted_dot = round(d$wdot, 5),
-        reverse_dot = round(d$rdot, 5),
-        stringsAsFactors = FALSE
-      )
-      if (!is.null(r$prec)) {
-        out$delta_ppm <- round(1e6 * (d$precursor_mz - r$prec) / r$prec, 2)
-      }
+      # Every spectrum's hits in one frame, each row carrying the query it came
+      # from and its rank, so a batch run drops straight into a pivot table.
+      out <- do.call(rbind, lapply(seq_along(r$hits), function(i) {
+        d <- r$hits[[i]]
+        if (nrow(d) == 0) return(NULL)
+        prec <- attr(d, "prec")
+        o <- data.frame(
+          query          = r$meta$name[i],
+          query_index    = i,
+          query_mz       = r$meta$precursor_mz[i],
+          query_adduct   = r$meta$adduct[i],
+          query_polarity = r$meta$ion_mode[i],
+          n_query_peaks  = nrow(r$peaks[[i]]),
+          rank           = seq_len(nrow(d)),
+          name           = d$name,
+          lipid_class    = d$lipid_class,
+          formula        = d$formula,
+          precursor_mz   = round(d$precursor_mz, 4),
+          adduct         = d$adduct,
+          ion_mode       = d$ion_mode,
+          retention_time = round(d$retention_time, 3),
+          n_matched      = d$n_match,
+          dot            = round(d$dot, 5),
+          weighted_dot   = round(d$wdot, 5),
+          reverse_dot    = round(d$rdot, 5),
+          stringsAsFactors = FALSE
+        )
+        if (!is.null(prec)) {
+          o$delta_ppm <- round(1e6 * (d$precursor_mz - prec) / prec, 2)
+        }
+        o
+      }))
+      if (is.null(out)) out <- data.frame()
       write.csv(out, file, row.names = FALSE, na = "")
     }
   )
+
 }
 
 shinyApp(ui, server)
